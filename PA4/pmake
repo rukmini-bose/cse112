@@ -1,0 +1,403 @@
+#!/usr/bin/perl
+# Rukmini Bose
+# rubose@ucsc.edu
+use strict;
+use warnings;
+use Getopt::Std;
+
+# Global control, populated during parse and sanitize.
+my $vrbs; # verbose flag
+my %mcrs = (); # macros
+my %cmds = (); # commands
+my %deps = (); # dependencies
+my %wlds = (); # wildcard dependencies
+my %wcds = (); # wildcard commands
+my $trgt; # (singular) executed target
+my $frst; # first non-wildcard target specified in Makefile
+
+# Displays control in verbose mode. Valid only after parse/sanitize.
+sub debug() {
+  return unless $vrbs; 
+  print "===MACROS===\n";
+  my $k;
+  my $v;
+  while ( ($k,$v) = each %mcrs ) {
+    print "$k => $v\n";
+  }
+  print "===CMDS===\n";
+  while ( ($k,$v) = each %cmds ) {
+    print "$k => $v\n";
+  }
+  print "===DEPS===\n";
+  while ( ($k,$v) = each %deps ) {
+    print "$k => @$v\n";
+  }
+  print "===WCDS===\n";
+  while ( ($k,$v) = each %wcds ) {
+    print "$k => $v\n";
+  }
+  print "===WLDS===\n";
+  while ( ($k,$v) = each %wlds ) {
+    print "$k => @$v\n";
+  }  
+  print "===TARGET===\n";
+  print "$trgt\n";
+}
+
+# Forward-declaration to remove prototype warning.
+sub evaluate($$);
+
+# Shell-level sanity check and verbosity determination.
+sub sanitize() {
+  # Avoid global variable
+  my %opts = ();
+  getopts('d', \%opts);
+  $vrbs = defined $opts{d};
+  if ($#ARGV > 0) {
+    printf STDERR "Usage: pmake [-d] [target]\n";
+    exit(1);
+  }
+}
+
+# Parses one line. Returns the target that the NEXT line reports to, or
+# undef if such a target does not exist.
+sub parse_line($$) {
+  my $line = $_[0];
+  # Immediately replace all $$ with $
+  $line =~ s/\$\$/\$/g;
+  my $old_target = $_[1];
+  # Matches comment or empty line
+  if ($line =~ m/^\s*$/ or $line =~ m/^#/) {
+    return $old_target;
+  # Matches target : dependencies
+  } elsif ($line =~ m/^(\S+)\s*:\s*(.*?)\s*$/) {
+    my ($target, $rest) = ($1, $2);
+    my @depends = split m/\s+/, $rest;
+    # Wildcard data goes in separate table
+    if ($target =~ m/\%/) {
+      $wlds{$target} = \@depends;
+    } else {
+      $deps{$target} = \@depends;
+      # Only non-wildcards can be considered for default target
+      $frst = $target unless defined $frst;
+    }
+    return $target;
+  # Matches macro = value
+  } elsif ($line =~ m/^(\S+)\s*=\s*(.*?)\s*$/) { 
+    my ($macro, $value) = ($1, $2);
+    $mcrs{$macro} = $value;
+    return undef;
+  # Matches tab as firstcar (i.e. command)
+  } elsif ($line =~ m/^\t/) {
+    my $cmd = substr($line, 1);
+    # TODO: support multiple commands.
+    # Requires arrayref-type values, not strings, in %cmds
+    unless ($old_target =~ m/\%/) {
+      $cmds{$old_target} = $cmd;  
+    } else {
+      $wcds{$old_target} = $cmd;
+    }
+    return $old_target;
+  } else {
+    printf STDERR "pmake: Bad line in Makefile.  Stop.\n";
+    return undef;
+  }
+}
+
+# Parses Makefile.
+sub parse() {
+  open(my $fh, '<', "Makefile")
+    or die "pmake: No makefile found.  Stop.";
+  my $res = undef;
+  while (my $row = <$fh>) {
+    chomp $row;
+    $res = parse_line("$row", $res);
+  }
+  # If no target was explicitly provided...
+  if ($#ARGV == -1) {
+    # ...error if either no targets, or only wildcards exist...
+    if (not defined $frst) { 
+      printf STDERR "pmake: *** No targets.  Stop.\n";
+      exit(1);
+    } else { # ...otherwise default to $first
+      $trgt = $frst;
+    }
+  } else { 
+    $trgt = ($ARGV[0]);
+  }
+}
+
+# Ensures no {...} in mcrs
+sub squash_mcrs() {
+  while ( (my $k, my $v) = each %mcrs ) {
+    my $squash = $v;
+    my $did_enter = 0;
+    while ($squash =~ m/\$\{([^}]*)}/) {
+      my $replace = $1;
+      $did_enter = 1;
+      $squash =~ s/\$\{[^}]*}/$mcrs{$replace}/;
+    }
+    if ($did_enter) {
+      $mcrs{$k} = $squash;
+    }
+  }
+}
+
+# Ensures no {...} in cmds
+sub squash_cmds() {
+  my %ugly_keys = ();
+  while ( (my $k, my $v) = each %cmds ) {
+    # Squashing keys doesn't require iteration
+    my $squash = $k;
+    if ($squash =~ m/\$\{([^}]*)}/) {
+      my $replace = $1;
+      $squash =~ s/\$\{[^}]*}/$mcrs{$replace}/;
+      $ugly_keys{$k} = $squash;
+    }
+    # Squashing values does
+    $squash = $v;
+    my $did_enter = 0;
+    while ($squash =~ m/\$\{([^}]*)}/) {
+      my $replace = $1;
+      $did_enter = 1;
+      $squash =~ s/\$\{[^}]*}/$mcrs{$replace}/;
+    }
+    if ($did_enter) {
+      $cmds{$k} = $squash;
+    }
+  }
+  # Remove ugly keys from cmds
+  while ( (my $k, my $v) = each %ugly_keys ) {
+    $cmds{$v} = delete($cmds{$k});  
+  }
+}
+
+# Ensures no {...} in wcds
+sub squash_wcds() {
+  while ( (my $k, my $v) = each %wcds ) {
+    my $squash = $v;
+    my $did_enter = 0;
+    while ($squash =~ m/\$\{([^}]*)}/) {
+      my $replace = $1;
+      $did_enter = 1;
+      $squash =~ s/\$\{[^}]*}/$mcrs{$replace}/;
+    }
+    if ($did_enter) {
+      $wcds{$k} = $squash;
+    }
+  }
+}
+
+# Ensures no {...} in deps
+sub squash_deps() {
+  my $k;
+  my $v;
+  my %ugly_keys = ();
+  while ( ($k,$v) = each %deps ) {
+    # Squashing keys doesn't require iteration
+    my $squash = $k;
+    if ($squash =~ m/\$\{([^}]*)}/) {
+      my $replace = $1;
+      $squash =~ s/\$\{[^}]*}/$mcrs{$replace}/;
+      $ugly_keys{$k} = $squash;
+    }
+    # Squashing values does
+    my $tmp = $deps{$k};
+    my @dep = @$tmp;
+    my $has_macro = 0;
+    # Optimize for non-macro case
+    for my $entry (@dep) {
+      if ($entry =~ m/^\$\{.*}$/) {
+        $has_macro = 1;
+        last;
+      }
+    }
+    next unless $has_macro;
+    my @new_deps = ();
+    for my $entry (@dep) {
+      if ($entry =~ m/^\$\{(\S+)}$/) {
+        my @depends = split m/\s+/, $mcrs{$1};
+        push @new_deps, @depends;
+      } else {
+        push @new_deps, $entry;
+      }
+    }
+    $deps{$k} = \@new_deps;    
+  }
+  # Remove ugly keys from deps
+  while ( ($k,$v) = each %ugly_keys ) {
+    $deps{$v} = delete($deps{$k});
+  }
+}
+
+# File creation-time utility.
+sub mtime ($) {
+  my ($filename) = @_;
+  my @stat = stat $filename;
+  return @stat ? $stat[9] : undef;
+}
+
+# Decides whether to quit by after receiving 'wait'.
+sub dispatch($$$) {
+  my $bits = $_[0];
+  my $term_signal = ($bits & 0x7F);
+  my $exit_status = (($bits >> 8) & 0xFF);
+  unless ($term_signal == 0 and $exit_status == 0) {
+    my $target = $_[2];
+    if ($_[1]) {
+      printf STDOUT "pmake: [$target] Error $exit_status (ignored)\n";
+    } else {
+      printf STDERR "pmake: *** [$target] Error $exit_status\n";
+      exit(1);
+    }
+  }
+}
+
+# Executes a singular command corresponding to some target. Handles @ by
+# not echoing the command, and - by proceeding despite errors.
+# TODO: support multi-command targets
+sub execute($$) {
+  my ($line) = @_;
+  if ($line =~ m/^@\s*(.*?)\s*$/) {
+    system($1);
+    dispatch($?, 0, $_[1]);
+  } elsif ($line =~ m/^-\s*(.*?)\s*$/) {
+    printf STDOUT "$1\n";
+    system($1);
+    dispatch($?, 1, $_[1]);
+  } else {
+    printf STDOUT "$line\n";
+    system($line);
+    dispatch($?, 0, $_[1]);
+  }
+}
+
+# Recursive subroutine to evaluate a target. Returns 1 if any command
+# was ever executed, 0 otherwise, even if the execution happened in a
+# different "branch".
+sub evaluate($$) {
+  my $t = $_[0]; # (non-wildcard) target to evaluate
+  my $did_eval = $_[1]; # indicator of any prior execution
+  my $found_exact = exists($deps{$t});
+  my $found_wildcard = 0;
+  my $max_so_far = 0;
+  # The command to execute for this target, might come from wildcard.
+  my $cmd;
+  # The first prereq, in case we'll need it for the $< replacement.
+  my $frst_prq;
+  # Process exact prereqs first, if present.
+  if ($found_exact) {
+    my @prqs = @{$deps{$t}};
+    # Depth-first processing w.r.t. dependencies
+    foreach ( @prqs ) {
+      # If the prereq is a target, then recursively evaluate it.
+      if (exists($deps{$_})) {
+        $did_eval = evaluate($_, $did_eval);
+        # Update latest time if prereq file was created in last step
+        if (-e $_) {
+          my $prq_time = mtime($_);
+          $max_so_far = $prq_time if $prq_time > $max_so_far;
+        }
+      # Otherwise, expect a file that exists; error if it doesn't.
+      } elsif (not -e $_) {
+        printf STDERR "$0: $_: $!\n";
+        exit(1);
+      # Otherwise, update the most recent prereq creation time.
+      } else {
+        my $prq_time = mtime($_);
+        $max_so_far = $prq_time if ($max_so_far < $prq_time);
+      }
+      $frst_prq = $_ unless defined $frst_prq;
+    }
+    $cmd = $cmds{$t} if exists $cmds{$t};
+  }
+
+  # Process wildcard prereqs, if any match.
+  while ( (my $k, my $v) = each %wlds ) {
+    if ($k =~ m/^(.*)\%(.*)$/) {
+      my $pattern = '^' . (quotemeta $1) .'(.+)'
+        . (quotemeta $2) . '$';
+      if ($t =~ m/$pattern/) {
+        $found_wildcard = 1;
+        my $subs = $1;
+        my @prqs = @{$wlds{$k}};
+        # Depth-first processing w.r.t. dependencies
+        foreach ( @prqs ) {
+          my $prq = $_;
+          # If the prereq is a target, then recursively evaluate it.
+          if (exists($deps{$prq})) {
+            $did_eval = evaluate($prq, $did_eval);
+            # Update latest time if prereq file was created in last step
+            if (-e $prq) {
+              my $prq_time = mtime($prq);
+              $max_so_far = $prq_time if $prq_time > $max_so_far;
+            }
+          # Otherwise it might need a substitution first
+          } elsif ($prq =~ m/\%/) {
+            $prq =~ s/\%/$subs/;
+            # Now recursively evaluate the substitution.
+            $did_eval = evaluate($prq, $did_eval);
+            # Update latest time if prereq file was created in last step
+            if (-e $prq) {
+              my $prq_time = mtime($prq);
+              $max_so_far = $prq_time if $prq_time > $max_so_far;
+            }
+          # Otherwise, expect a file that exists; error if it doesn't.
+          } elsif (not -e $prq) {
+            printf STDERR "pmake: $prq: $!\n";
+            exit(1);
+          # Otherwise, update the most recent prereq creation time.
+          } else {
+            my $prq_time = mtime($_);
+            $max_so_far = $prq_time if ($max_so_far < $prq_time);
+          }
+          $frst_prq = $prq unless defined $frst_prq;
+        }
+        $cmd = $wcds{$k} unless defined $cmd;
+        # Short-circuit since test cases are simple
+        last;
+      }
+    }
+  }
+
+  if (defined $cmd) {
+    $cmd =~ s/\$\</$frst_prq/g;
+    $cmd =~ s/\$\@/$t/g;
+  }
+
+  # Error if target had no dependencies and doesn't already exist as a
+  # file in wd.
+  if ((not $found_wildcard) and (not $found_exact)
+      and (not -e $t)) {
+    printf STDERR "pmake: *** No rule to make target `$t'.  Stop.\n";
+    exit(1);
+  }
+  
+  # Run command, if it exists, whenever target is stale.
+  unless ((not defined($cmd)) or
+      (-e $t and (mtime($t) > $max_so_far))) {
+    execute($cmd, $t);
+    return 1;
+  }
+  return $did_eval;
+}
+
+# Top-level evaluate call, appropriately prints inaction messages.
+sub evaluate_top() {
+  unless (evaluate($trgt, 0)) {
+    if (exists($cmds{$trgt})) {
+      printf STDOUT "pmake: `$trgt' is up to date.\n"
+    } else {
+      printf STDOUT "pmake: Nothing to be done for `$trgt'.\n"
+    }
+  }  
+}
+
+sanitize();
+parse();
+squash_mcrs();
+squash_cmds();
+squash_wcds();
+squash_deps();
+debug();
+evaluate_top();

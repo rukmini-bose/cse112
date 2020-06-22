@@ -1,0 +1,14 @@
+Quadratic Equation solver.
+Input a, b, c
+Equation: 1 * x ^ 2 +0 * x +0
+root1 = 0
+root2 = 0
+Input a, b, c
+Equation: 1 * x ^ 2 +1 * x +0
+root1 = 0
+root2 = -1
+Input a, b, c
+Equation: 2 * x ^ 2 +2 * x +2
+root1 = -0.5+0.8660254037844386i
+root2 = -0.5-0.8660254037844386i
+Input a, b, c
